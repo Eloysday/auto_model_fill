@@ -1,18 +1,20 @@
-version: '3.8'
-
 services:
   app:
     build: .
     ports:
       - "8000:8000"
     volumes:
-      - .:/app              # 代码挂载（git pull 自动生效）
-      - jobs_data:/app/jobs  # job 持久化
+      # 本地代码实时挂载，修改代码自动热重载
+      - .:/app
+      # 持久化任务数据，容器删除数据不丢失
+      - jobs_data:/app/jobs
     env_file:
       - .env
+    # uvicorn 开发热启动配置
     command: >
       uvicorn server:app --host 0.0.0.0 --port 8000 --reload --reload-dir /app
     restart: unless-stopped
 
+# 持久化数据卷定义
 volumes:
   jobs_data:
