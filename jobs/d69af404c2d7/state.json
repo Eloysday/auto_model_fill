@@ -1,0 +1,15 @@
+{
+  "status": "completed",
+  "progress": 7,
+  "instructions": "",
+  "created_at": "2026-06-21T14:20:00Z",
+  "updated_at": "2026-06-21T14:23:00Z",
+  "input_files": [
+    "template.docx",
+    "data.csv"
+  ],
+  "output_file": "report.docx",
+  "error": null,
+  "steps": 7,
+  "duration_s": 180.5
+}
