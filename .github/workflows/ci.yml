@@ -1,7 +1,9 @@
-name: CI/CD
+name: CI
 
 on:
   push:
+    branches: [main, master]
+  pull_request:
     branches: [main, master]
 
 jobs:
@@ -18,15 +20,3 @@ jobs:
           KEY: sk-test
           BASE_URL: https://api.deepseek.com
           FLASH_MODEL: deepseek-chat
-
-  build-and-push:
-    needs: test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Log in to Docker Hub
-        run: echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
-      - name: Build and push
-        run: |
-          docker build -t ${{ secrets.DOCKER_USERNAME }}/parking-report-agent:latest .
-          docker push ${{ secrets.DOCKER_USERNAME }}/parking-report-agent:latest

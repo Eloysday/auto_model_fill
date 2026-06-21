@@ -1,41 +1,18 @@
 version: '3.8'
 
 services:
-  # ── 开发模式：本地代码挂载 + 热重载 ──
-  dev:
-    build: .
-    ports:
-      - "8000:8000"
-    volumes:
-      - .:/app
-      - jobs_data:/app/jobs
-    env_file:
-      - .env
-    command: >
-      uvicorn server:app --host 0.0.0.0 --port 8000 --reload --reload-dir /app
-    profiles:
-      - dev
-
-  # ── 生产模式：冻结镜像 + 数据持久化 ──
   app:
     build: .
     ports:
       - "8000:8000"
     volumes:
-      - jobs_data:/app/jobs
+      - .:/app              # 代码挂载（git pull 自动生效）
+      - jobs_data:/app/jobs  # job 持久化
     env_file:
       - .env
+    command: >
+      uvicorn server:app --host 0.0.0.0 --port 8000 --reload --reload-dir /app
     restart: unless-stopped
-
-  # ── 自动部署：监控 Docker Hub 新镜像，自动拉取并重启 ──
-  watchtower:
-    image: containrrr/watchtower
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-    command: --interval 30 --cleanup parking-report-agent
-    restart: unless-stopped
-    profiles:
-      - deploy
 
 volumes:
   jobs_data:
