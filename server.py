@@ -1,7 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-server.py —— 停车报告 Agent 系统 Web 服务
+server.py —— 停车报告 Agent 系统 Web 服务（asyncio + subprocess）
+
+架构:
+  FastAPI (async) → asyncio.Semaphore → subprocess: agent_worker.py
+  每个 Job 在独立子进程中运行，物理隔离，消除并发竞态。
+
+并发:
+  通过 asyncio.Semaphore 限制同时运行的子进程数（匹配 CPU 核数）。
+  通过 _pending_count 限制排队数量，超限返回 503。
 
 API:
   POST /api/jobs                 上传文件，创建生成任务
@@ -11,17 +19,14 @@ API:
 前端: GET / → templates/index.html
 """
 
+import asyncio
 import os
 import sys
-import json
-import threading
-import time as _time
 from pathlib import Path
-from datetime import datetime
 
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse
-from fastapi.staticfiles import StaticFiles
+from contextlib import asynccontextmanager
 import uvicorn
 
 # ── 本地模块 ──────────────────────────────────────────────
@@ -32,12 +37,69 @@ from job_manager import JobManager
 from logging_utils import log_request
 
 # ═══════════════════════════════════════════════════════════
-app = FastAPI(title='Parking Report Agent')
-jobs = JobManager()
+# 配置（2 核 / 4 GB 服务器优化）
+# ═══════════════════════════════════════════════════════════
 
-# 并发控制：信号量限制同时运行的 Agent 数量
-MAX_CONCURRENT = int(os.environ.get('MAX_CONCURRENT_JOBS', '3'))
-_semaphore = threading.BoundedSemaphore(MAX_CONCURRENT + 20)  # 3 并发 + 20 排队
+MAX_CONCURRENT = int(os.environ.get('MAX_CONCURRENT_JOBS', '2'))
+MAX_QUEUE_DEPTH = int(os.environ.get('MAX_QUEUE_DEPTH', '6'))
+JOB_TIMEOUT = int(os.environ.get('JOB_TIMEOUT', '600'))
+SHUTDOWN_GRACE = int(os.environ.get('SHUTDOWN_GRACE_SECONDS', '30'))
+
+# ═══════════════════════════════════════════════════════════
+# 全局状态
+# ═══════════════════════════════════════════════════════════
+
+jobs = JobManager()
+_semaphore = asyncio.Semaphore(MAX_CONCURRENT)
+_pending_count = 0                    # 等待中（含排队 + 已获取信号量但未完成）的 job 数
+_running_procs: dict[str, asyncio.subprocess.Process] = {}
+_shutting_down = False
+
+
+# ═══════════════════════════════════════════════════════════
+# 生命周期
+# ═══════════════════════════════════════════════════════════
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """启动诊断；关闭时优雅终止所有子进程。"""
+    global _shutting_down
+
+    # ── Startup 诊断 ──
+    print(f'[server] Python: {sys.executable}')
+    print(f'[server] Event loop: {type(asyncio.get_event_loop()).__name__}')
+    _check_subprocess_support()
+
+    yield  # ← App 运行
+
+    # ── Shutdown ──
+    print('[server] 正在关闭...')
+    _shutting_down = True
+
+    # 终止所有运行中的子进程
+    procs = list(_running_procs.items())
+    if procs:
+        print(f'[server] 终止 {len(procs)} 个运行中的 job...')
+        for job_id, proc in procs:
+            try:
+                proc.terminate()
+            except ProcessLookupError:
+                continue
+
+        for job_id, proc in procs:
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=SHUTDOWN_GRACE)
+            except asyncio.TimeoutError:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                await proc.wait()
+                print(f'[server] Job {job_id} 被强制终止')
+        print('[server] 所有子进程已终止')
+
+
+app = FastAPI(title='Parking Report Agent', lifespan=lifespan)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -45,7 +107,7 @@ _semaphore = threading.BoundedSemaphore(MAX_CONCURRENT + 20)  # 3 并发 + 20 �
 # ═══════════════════════════════════════════════════════════
 
 @app.get('/', response_class=HTMLResponse)
-def index():
+async def index():
     html_path = BASE_DIR / 'templates' / 'index.html'
     if html_path.exists():
         return html_path.read_text('utf-8')
@@ -57,45 +119,46 @@ def index():
 # ═══════════════════════════════════════════════════════════
 
 @app.post('/api/jobs')
-def create_job(
+async def create_job(
     template: UploadFile = File(...),
     data: UploadFile = File(...),
     instructions: str = Form(''),
 ):
     """上传 template.docx + data.csv，创建异步生成任务。"""
+    global _pending_count
+
+    if _shutting_down:
+        raise HTTPException(503, '服务正在关闭')
+
     # 校验文件类型
     if not template.filename.endswith('.docx'):
         raise HTTPException(400, 'template 必须是 .docx 文件')
     if not data.filename.endswith('.csv'):
         raise HTTPException(400, 'data 必须是 .csv 文件')
 
-    # 创建 job
+    # 排队上限检查
+    if _pending_count >= MAX_CONCURRENT + MAX_QUEUE_DEPTH:
+        raise HTTPException(503, '系统繁忙，请稍后重试')
+
+    # 创建 job（状态: queued）
     job_id = jobs.create(instructions)
-    jobs.save_input(job_id, 'template.docx', template.file.read())
-    jobs.save_input(job_id, 'data.csv', data.file.read())
+    jobs.save_input(job_id, 'template.docx', await template.read())
+    jobs.save_input(job_id, 'data.csv', await data.read())
 
     log_request('job_created', job_id,
                 input_files=['template.docx', 'data.csv'],
                 instructions=instructions)
 
-    # 并发控制（超过 3+20 上限则拒绝）
-    acquired = _semaphore.acquire(blocking=False)
-    if not acquired:
-        raise HTTPException(503, '系统繁忙，请稍后重试')
+    # 增加排队计数，启动后台任务
+    _pending_count += 1
+    asyncio.create_task(_run_with_semaphore(job_id))
 
-    def _run_with_release():
-        try:
-            _run_generation(job_id)
-        finally:
-            _semaphore.release()
-
-    threading.Thread(target=_run_with_release, daemon=True).start()
-
-    return {'job_id': job_id, 'status': 'created'}
+    log_request('job_queued', job_id)
+    return {'job_id': job_id, 'status': 'queued'}
 
 
 @app.get('/api/jobs/{job_id}')
-def get_job_status(job_id: str):
+async def get_job_status(job_id: str):
     """查询任务状态。"""
     state = jobs.get_state(job_id)
     if not state:
@@ -112,7 +175,7 @@ def get_job_status(job_id: str):
 
 
 @app.get('/api/jobs/{job_id}/download')
-def download_report(job_id: str):
+async def download_report(job_id: str):
     """下载生成的 .docx 报告。"""
     state = jobs.get_state(job_id)
     if not state:
@@ -127,140 +190,161 @@ def download_report(job_id: str):
         raise HTTPException(404, '报告文件丢失')
 
     log_request('job_downloaded', job_id)
-    return FileResponse(str(path), filename=state['output_file'],
-                        media_type='application/vnd.openxmlformats-officedocument.wordprocessingml.document')
+    return FileResponse(
+        str(path),
+        filename=state['output_file'],
+        media_type='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    )
 
 
 # ═══════════════════════════════════════════════════════════
-# Agent 执行（后台线程）
+# Job 执行
 # ═══════════════════════════════════════════════════════════
 
-def _run_generation(job_id: str):
-    """在后台线程中运行 Agent 生成报告。"""
-    start_time = _time.time()
+def _safe_print(msg: str):
+    """安全打印，避免 Windows GBK 终端编码错误。"""
+    try:
+        print(msg, flush=True)
+    except UnicodeEncodeError:
+        print(msg.encode('utf-8', errors='replace').decode('utf-8', errors='replace'), flush=True)
+
+
+def _check_subprocess_support():
+    """启动时检测子进程机制是否可用。"""
+    import subprocess as _sp
+    worker = BASE_DIR / 'agent_worker.py'
+    if not worker.exists():
+        print(f'[server] ⚠️  Worker 脚本不存在: {worker}')
+        return
+
+    # 测试同步 subprocess（兜底方案）
+    try:
+        r = _sp.run([sys.executable, str(worker), '--help'],
+                    capture_output=True, timeout=5)
+        print(f'[server] ✅ subprocess 可用 (sync)')
+    except Exception as e:
+        print(f'[server] ⚠️  subprocess 不可用: {e}')
+
+    # 测试 asyncio subprocess
+    try:
+        loop = asyncio.get_event_loop()
+        # 只是检查方法存在，不实际启动
+        if hasattr(loop, 'subprocess_exec'):
+            print(f'[server] ✅ asyncio subprocess 可用')
+        else:
+            print(f'[server] ⚠️  asyncio subprocess 不可用，将使用同步 fallback')
+    except Exception as e:
+        print(f'[server] ⚠️  asyncio 检查失败: {e}')
+
+
+async def _run_with_semaphore(job_id: str):
+    """获取信号量后执行子进程，完成后释放。"""
+    global _pending_count
+    try:
+        async with _semaphore:
+            await _run_job_subprocess(job_id)
+    except Exception as e:
+        _safe_print(f'[server] Job {job_id} 异常: {type(e).__name__}: {e}')
+        # 确保 job 被标记为失败（worker 进程可能根本没启动）
+        state = jobs.get_state(job_id)
+        if state and state['status'] not in ('completed', 'failed'):
+            jobs.set_error(job_id, f'执行异常: {type(e).__name__}: {e}')
+    finally:
+        _pending_count -= 1
+
+
+async def _run_job_subprocess(job_id: str):
+    """启动 agent_worker.py 子进程并等待完成。
+
+    优先使用 asyncio.create_subprocess_exec；
+    若抛出 NotImplementedError 则回退到同步 subprocess（线程池）。
+    """
+    worker_script = BASE_DIR / 'agent_worker.py'
+
+    if not worker_script.exists():
+        raise FileNotFoundError(f'Worker 脚本不存在: {worker_script}')
 
     try:
-        jobs.transition(job_id, 'running')
-        jobs.set_progress(job_id, 0, steps=7)
+        await _run_via_async_subprocess(job_id, worker_script)
+    except NotImplementedError:
+        print(f'[server] asyncio subprocess 不可用，回退到同步模式')
+        await _run_via_sync_subprocess(job_id, worker_script)
 
-        # ── Step 1: 转换 template.docx → JSON ──
-        _update_progress(job_id, 1, 'converting template')
-        _convert_template(job_id)
 
-        # ── Step 2-7: 运行 Agent ──
-        _update_progress(job_id, 2, 'running agent')
-        _run_agent_for_job(job_id)
+async def _run_via_async_subprocess(job_id: str, worker_script):
+    """asyncio 原生子进程（高性能，首选）。"""
+    env = {**os.environ, 'PYTHONIOENCODING': 'utf-8'}
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, str(worker_script),
+        '--job-id', job_id,
+        '--timeout', str(JOB_TIMEOUT),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=env,
+    )
+    _running_procs[job_id] = proc
 
-        # ── 完成：注册输出文件（如果 Agent 未调用 restore_to_docx，兜底还原）──
-        output_path = jobs.get_output_dir(job_id) / 'report.docx'
-        filled_json = jobs.get_output_dir(job_id) / 'filled_template.json'
-        if not output_path.exists() and filled_json.exists():
-            print(f'[server] Agent 未生成 docx，从 filled_template.json 兜底还原')
-            from json_to_docx import restore_docx
-            restore_docx(str(filled_json), str(output_path))
-        if not output_path.exists():
-            raise RuntimeError('Agent 未生成输出文件')
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=JOB_TIMEOUT + 10)
 
-        # 将输出文件注册到 job state（下载端点依赖 output_file 字段）
-        jobs._set_output_file(job_id, 'report.docx')
+        if proc.stdout:
+            output = await proc.stdout.read()
+            if output:
+                _safe_print(output.decode('utf-8', errors='replace').strip())
+        if proc.stderr:
+            err = await proc.stderr.read()
+            if err:
+                _safe_print('[worker stderr] ' + err.decode('utf-8', errors='replace').strip())
 
-        elapsed = round(_time.time() - start_time, 1)
-        jobs.transition(job_id, 'completed', duration_s=elapsed)
-        jobs.set_progress(job_id, 7, steps=7)
-        log_request('job_completed', job_id,
-                    output='report.docx', duration_s=elapsed,
-                    steps=_get_agent_steps(job_id))
+        if proc.returncode != 0:
+            _safe_print(f'[server] Job {job_id} 退出码 {proc.returncode}')
 
+    except asyncio.TimeoutError:
+        _safe_print(f'[server] Job {job_id} 超时，强制终止')
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        await proc.wait()
+        jobs.set_error(job_id, f'任务执行超时（{JOB_TIMEOUT}s）')
+        log_request('job_timeout', job_id)
+
+    finally:
+        _running_procs.pop(job_id, None)
+
+
+async def _run_via_sync_subprocess(job_id: str, worker_script):
+    """同步 subprocess（回退方案，在默认线程池中运行）。"""
+    import subprocess as _sp
+
+    loop = asyncio.get_event_loop()
+
+    def _run():
+        return _sp.run(
+            [sys.executable, str(worker_script),
+             '--job-id', job_id, '--timeout', str(JOB_TIMEOUT)],
+            capture_output=True,
+            encoding='utf-8',        # 强制 UTF-8，避免 Windows GBK 乱码
+            errors='replace',
+            timeout=JOB_TIMEOUT + 10,
+            env={**os.environ, 'PYTHONIOENCODING': 'utf-8'},
+        )
+
+    try:
+        result = await loop.run_in_executor(None, _run)
+        if result.stdout:
+            _safe_print(result.stdout.strip())
+        if result.stderr:
+            _safe_print('[worker stderr] ' + result.stderr.strip())
+        if result.returncode != 0:
+            _safe_print(f'[server] Job {job_id} 退出码 {result.returncode}')
+    except _sp.TimeoutExpired:
+        _safe_print(f'[server] Job {job_id} 超时')
+        jobs.set_error(job_id, f'任务执行超时（{JOB_TIMEOUT}s）')
+        log_request('job_timeout', job_id)
     except Exception as e:
-        elapsed = round(_time.time() - start_time, 1)
-        error_msg = f'{type(e).__name__}: {e}'
-        jobs.set_error(job_id, error_msg)
-        log_request('job_failed', job_id, error=error_msg, duration_s=elapsed)
-        import traceback
-        traceback.print_exc()
-
-
-def _update_progress(job_id: str, step: int, detail: str = ''):
-    jobs.set_progress(job_id, step)
-    log_request('job_progress', job_id, step=step, detail=detail)
-
-
-def _convert_template(job_id: str):
-    """将用户上传的 template.docx 转为 template_full.json。"""
-    from docx2json import docx_to_json
-
-    docx_path = jobs.get_input_path(job_id, 'template.docx')
-    json_path = jobs.get_input_path(job_id, 'template_full.json')
-
-    full = docx_to_json(str(docx_path))
-    json_path.write_text(json.dumps(full, ensure_ascii=False, indent=2), 'utf-8')
-
-    log_request('job_progress', job_id, step=1,
-                detail=f'converted: {len(full["blocks"])} blocks, {len(full["styles"])} styles')
-
-
-def _run_agent_for_job(job_id: str):
-    """设置环境变量后运行 core_agent。"""
-    # 传递 job 根目录（一个变量替代所有路径，避免并发竞态覆盖）
-    job_root = jobs.root / job_id
-    os.environ['AGENT_JOB_DIR'] = str(job_root)
-    os.environ['TEMPLATE_JSON'] = 'template_full.json'
-    os.environ['TEMPLATE_CSV'] = 'data.csv'
-
-    # 清除缓存的模块以获取新路径
-    for key in list(sys.modules.keys()):
-        if 'core_agent' in key:
-            del sys.modules[key]
-
-    # 动态导入并打补丁 — 注入 logger
-    import core_agent as ca
-
-    # 加载数据
-    ca._load_template()
-    ca._load_csv()
-
-    csv_rows = ca._csv_rows
-    blocks = len(ca._template_data['blocks'])
-
-    log_request('job_started', job_id, csv_rows=len(csv_rows) if csv_rows else 0, blocks=blocks)
-
-    # 打补丁：拦截 LLM 调用以记录日志
-    _patch_agent_for_logging(ca, job_id)
-
-    # 注入用户指令（通过环境变量传入，避免并发修改全局变量）
-    state = jobs.get_state(job_id)
-    instructions = (state or {}).get('instructions', '').strip()
-    if instructions:
-        os.environ['AGENT_USER_INSTRUCTIONS'] = instructions
-    else:
-        os.environ.pop('AGENT_USER_INSTRUCTIONS', None)
-
-    # 运行 Agent
-    agent = ca.TemplateFillerAgent()
-    agent.run()
-
-
-def _patch_agent_for_logging(ca_module, job_id: str):
-    """通过环境变量传递 job_id，Agent 内部自行记录 LLM 日志。"""
-    os.environ['AGENT_LOG_JOB_ID'] = job_id
-
-
-def _get_agent_steps(job_id: str) -> int:
-    """从 LLM 日志推断调用次数。"""
-    log_path = jobs.root / job_id / 'llm_calls.jsonl'
-    if log_path.exists():
-        return sum(1 for _ in open(log_path, 'r', encoding='utf-8'))
-    return 0
-
-    AgentClass.setup = _setup_with_logging
-
-
-def _get_agent_steps(job_id: str) -> int:
-    """从 LLM 日志推断 agent 执行了多少步。"""
-    log_path = jobs.root / job_id / 'llm_calls.jsonl'
-    if log_path.exists():
-        return sum(1 for _ in open(log_path, 'r', encoding='utf-8'))
-    return 0
+        _safe_print(f'[server] Job {job_id} 同步执行异常: {type(e).__name__}: {e}')
+        raise
 
 
 # ═══════════════════════════════════════════════════════════
@@ -270,7 +354,8 @@ def _get_agent_steps(job_id: str) -> int:
 if __name__ == '__main__':
     print('=' * 60)
     print('  Parking Report Agent — Server')
-    print('=' * 60)
+    print(f'  Max concurrent: {MAX_CONCURRENT} | Queue depth: {MAX_QUEUE_DEPTH}')
+    print(f'  Timeout: {JOB_TIMEOUT}s | Grace: {SHUTDOWN_GRACE}s')
     print(f'  http://localhost:8000')
     print('=' * 60)
     uvicorn.run(app, host='0.0.0.0', port=8000)

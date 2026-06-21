@@ -29,9 +29,10 @@ JOBS_ROOT = Path(__file__).resolve().parent / 'jobs'
 # ── 状态机 ────────────────────────────────────────────────
 VALID_TRANSITIONS = {
     'created':   ['running'],
+    'queued':    ['running'],           # 排队 → 执行
     'running':   ['completed', 'failed'],
-    'completed': [],           # 终态
-    'failed':    ['running'],  # 允许重试
+    'completed': [],                    # 终态
+    'failed':    ['running'],           # 允许重试
 }
 
 
@@ -52,7 +53,7 @@ class JobManager:
         (job_dir / 'charts').mkdir(parents=True)
 
         state = {
-            'status': 'created',
+            'status': 'queued',
             'progress': 0,
             'instructions': instructions,
             'created_at': _now(),

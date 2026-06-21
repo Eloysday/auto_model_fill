@@ -10,7 +10,8 @@ services:
       - ./jobs:/app/jobs
     env_file:
       - .env
-    # uvicorn 开发热启动配置
+    # 生产模式（asyncio + subprocess 架构，无需 reload）
     command: >
-      uvicorn server:app --host 0.0.0.0 --port 8000 --reload --reload-dir /app
+      uvicorn server:app --host 0.0.0.0 --port 8000
     restart: unless-stopped
+    stop_grace_period: 60s

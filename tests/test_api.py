@@ -5,15 +5,15 @@ test_api.py —— API 级测试：submit → status → download
 
 运行: python -m pytest tests/test_api.py -v
 
-test_full_lifecycle 通过 mock threading.Thread 拦截后台线程，
+test_full_lifecycle 通过 mock _run_job_subprocess 拦截子进程启动，
 同步完成 job 并验证完整 submit → status → download 链路。
 """
 
 import io
 import sys
-import json
+import time as _time
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, AsyncMock
 
 import pytest
 
@@ -22,17 +22,18 @@ sys.path.insert(0, str(BASE_DIR))
 
 
 # ═══════════════════════════════════════════════════════════
-# 全局 mock：在所有测试前替换 threading.Thread
+# 全局 mock：替换 _run_job_subprocess 为同步完成
 # ═══════════════════════════════════════════════════════════
 
-_real_thread_cls = None  # 保存原始 Thread 类
-
-
-def _mock_generation(job_id: str):
-    """Mock: 直接写完成状态。"""
+async def _mock_run_job(job_id: str):
+    """Mock: 直接写完成状态（替代子进程）。"""
     from job_manager import JobManager
     jm = JobManager()
-    jm.transition(job_id, 'running')
+    # 确保 job 进入 running 状态
+    try:
+        jm.transition(job_id, 'running')
+    except ValueError:
+        pass  # 可能已经是 running
     jm.save_output(job_id, 'report.docx', b'mock report')
     jm.transition(job_id, 'completed', duration_s=0)
     jm.set_progress(job_id, 7, steps=7)
@@ -40,13 +41,13 @@ def _mock_generation(job_id: str):
 
 @pytest.fixture(scope='session', autouse=True)
 def mock_agent():
-    """Session 级别 mock：拦截 _run_generation，agent 同步完成。"""
-    with patch('server._run_generation', side_effect=_mock_generation):
+    """Session 级别 mock：拦截 _run_job_subprocess，同步完成 job。"""
+    with patch('server._run_job_subprocess', side_effect=_mock_run_job):
         yield
 
 
 # ═══════════════════════════════════════════════════════════
-# TestClient（在 mock 生效后导入）
+# TestClient
 # ═══════════════════════════════════════════════════════════
 
 from fastapi.testclient import TestClient
@@ -94,7 +95,7 @@ def test_create_job_success(sample_docx, sample_csv):
     assert resp.status_code == 200
     data = resp.json()
     assert 'job_id' in data
-    assert data['status'] in ('created', 'completed')  # mock 可能已同步完成
+    assert data['status'] in ('queued', 'running', 'completed')
 
 
 def test_create_job_rejects_wrong_type():
@@ -131,7 +132,7 @@ def test_download_nonexistent():
 def test_full_lifecycle(sample_docx, sample_csv):
     """
     端到端：submit → status → download。
-    threading.Thread 被 session mock 拦截，agent 同步完成。
+    _run_job_subprocess 被 session mock 拦截，同步完成 job。
     """
     # 1. Submit
     resp = client.post('/api/jobs', files={
@@ -142,8 +143,7 @@ def test_full_lifecycle(sample_docx, sample_csv):
     assert resp.status_code == 200
     job_id = resp.json()['job_id']
 
-    # 2. Status — 等待 mock 线程执行完成
-    import time as _time
+    # 2. Status — 等待 worker 处理完成
     status = None
     for _ in range(20):
         _time.sleep(0.05)
@@ -160,7 +160,6 @@ def test_full_lifecycle(sample_docx, sample_csv):
 
 
 def test_download_incomplete_rejected(sample_docx, sample_csv):
-    """未完成的 job 下载 → 400。"""
-    # mock 同步完成 → 所有 job 都是 completed，此测试改为验证正常拒绝逻辑
+    """不存在的 job 下载 → 404。"""
     resp = client.get('/api/jobs/nonexistent/download')
     assert resp.status_code == 404
