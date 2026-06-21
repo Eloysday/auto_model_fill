@@ -100,7 +100,7 @@ docker-compose up --build -d
 
 ---
 
-## CI/CD（面试展示）
+## CI/CD
 
 ```
 git push main → GitHub Actions → pytest 8/8 ✅
