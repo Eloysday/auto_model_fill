@@ -1,0 +1,32 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main, master]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - run: sudo apt-get install -y fonts-noto-cjk
+      - run: pip install -r requirements.txt pytest
+      - run: python -m pytest tests/test_api.py -v
+        env:
+          KEY: sk-test
+          BASE_URL: https://api.deepseek.com
+          FLASH_MODEL: deepseek-chat
+
+  build-and-push:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Log in to Docker Hub
+        run: echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
+      - name: Build and push
+        run: |
+          docker build -t ${{ secrets.DOCKER_USERNAME }}/parking-report-agent:latest .
+          docker push ${{ secrets.DOCKER_USERNAME }}/parking-report-agent:latest

@@ -1,0 +1,9 @@
+jobs/
+charts/
+__pycache__/
+*.pyc
+.env
+requests.jsonl
+filled_*.json
+filled_*.docx
+template_full.json

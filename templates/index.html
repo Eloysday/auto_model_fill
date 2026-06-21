@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>停车报告生成系统</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f5f7fa; color: #333; min-height: 100vh; display: flex; justify-content: center; padding: 40px 16px; }
+  .container { max-width: 680px; width: 100%; }
+  h1 { font-size: 22px; margin-bottom: 4px; color: #1a1a2e; }
+  .sub { font-size: 13px; color: #888; margin-bottom: 24px; }
+  .card { background: #fff; border-radius: 10px; padding: 22px; margin-bottom: 16px; box-shadow: 0 1px 4px rgba(0,0,0,.06); }
+  label { display: block; font-size: 13px; font-weight: 600; color: #555; margin-bottom: 5px; }
+  input[type=file], textarea { width: 100%; padding: 10px 12px; border: 1.5px solid #e0e0e0; border-radius: 6px; font-size: 14px; margin-bottom: 14px; background: #fafafa; }
+  textarea { resize: vertical; min-height: 50px; }
+  button { width: 100%; padding: 10px; background: #1a1a2e; color: #fff; border: none; border-radius: 6px; font-size: 15px; font-weight: 600; cursor: pointer; }
+  button:hover { background: #2d2d4a; }
+  button:disabled { background: #ccc; cursor: not-allowed; }
+
+  .task-list { margin-top: 8px; }
+  .task-item { display: flex; align-items: center; gap: 12px; padding: 12px 14px; border-radius: 8px; margin-bottom: 8px; font-size: 13px; }
+  .task-status { background: #fff3e0; color: #e65100; }
+  .task-running { background: #e3f2fd; color: #1565c0; }
+  .task-done { background: #e8f5e9; color: #2e7d32; }
+  .task-fail { background: #fce4ec; color: #c62828; }
+  .task-info { flex: 1; min-width: 0; }
+  .task-id { font-family: monospace; font-size: 11px; opacity: .7; }
+  .task-text { font-weight: 500; }
+  .task-actions { flex-shrink: 0; }
+  .spinner { width: 16px; height: 16px; border: 2px solid #ccc; border-top-color: #1565c0; border-radius: 50%; animation: spin .8s linear infinite; display: inline-block; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .btn-sm { display: inline-block; padding: 5px 14px; border-radius: 5px; font-size: 12px; font-weight: 600; text-decoration: none; cursor: pointer; border: none; }
+  .btn-dl { background: #2e7d32; color: #fff; }
+  .btn-dl:hover { background: #388e3c; }
+  .btn-del { background: none; color: #999; font-size: 16px; padding: 2px 6px; }
+  .no-tasks { text-align: center; color: #bbb; font-size: 13px; padding: 20px; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>停车明细分析报告</h1>
+  <p class="sub">上传模板和数据，自动生成分析报告。支持同时提交多个任务。</p>
+
+  <!-- Upload Card — 始终可见 -->
+  <div class="card" id="upload-card">
+    <label>模板文件 (.docx)</label>
+    <input type="file" id="template" accept=".docx">
+
+    <label>数据文件 (.csv)</label>
+    <input type="file" id="data" accept=".csv">
+
+    <label>补充指令（可选）</label>
+    <textarea id="instructions" placeholder="如「重点分析优惠券使用情况」"></textarea>
+
+    <button id="submit-btn" onclick="submitJob()">提交任务</button>
+  </div>
+
+  <!-- Task List -->
+  <div id="task-list" class="task-list">
+    <div class="no-tasks" id="no-tasks">暂无任务，上传文件开始</div>
+  </div>
+</div>
+
+<script>
+const tasks = {};  // jobId → { timer, status, ... }
+
+async function submitJob() {
+  const template = document.getElementById('template').files[0];
+  const data = document.getElementById('data').files[0];
+  const instructions = document.getElementById('instructions').value;
+
+  if (!template || !data) { alert('请上传模板和数据文件'); return; }
+  if (!template.name.endsWith('.docx')) { alert('模板必须是 .docx 文件'); return; }
+  if (!data.name.endsWith('.csv')) { alert('数据必须是 .csv 文件'); return; }
+
+  const btn = document.getElementById('submit-btn');
+  btn.disabled = true; btn.textContent = '提交中...';
+
+  const form = new FormData();
+  form.append('template', template);
+  form.append('data', data);
+  form.append('instructions', instructions);
+
+  try {
+    const resp = await fetch('/api/jobs', { method: 'POST', body: form });
+    if (!resp.ok) { const err = await resp.json(); throw new Error(err.detail); }
+    const result = await resp.json();
+    const jobId = result.job_id;
+
+    // Add task to list
+    tasks[jobId] = { status: 'created' };
+    renderTaskList();
+    tasks[jobId].timer = setInterval(() => pollTask(jobId), 2000);
+
+    // Clear file inputs for next upload
+    document.getElementById('template').value = '';
+    document.getElementById('data').value = '';
+    document.getElementById('instructions').value = '';
+  } catch (e) {
+    alert('提交失败: ' + e.message);
+  } finally {
+    btn.disabled = false; btn.textContent = '提交任务';
+  }
+}
+
+async function pollTask(jobId) {
+  try {
+    const resp = await fetch('/api/jobs/' + jobId);
+    if (!resp.ok) throw new Error('查询失败');
+    const s = await resp.json();
+
+    tasks[jobId].status = s.status;
+    tasks[jobId].progress = s.progress || 0;
+    tasks[jobId].steps = s.steps || 0;
+    tasks[jobId].error = s.error || '';
+
+    if (s.status === 'completed' || s.status === 'failed') {
+      clearInterval(tasks[jobId].timer);
+      tasks[jobId].timer = null;
+    }
+    renderTaskList();
+  } catch (e) {
+    tasks[jobId].status = 'failed';
+    tasks[jobId].error = '状态查询失败';
+    clearInterval(tasks[jobId].timer);
+    tasks[jobId].timer = null;
+    renderTaskList();
+  }
+}
+
+function removeTask(jobId) {
+  if (tasks[jobId] && tasks[jobId].timer) clearInterval(tasks[jobId].timer);
+  delete tasks[jobId];
+  renderTaskList();
+}
+
+function renderTaskList() {
+  const container = document.getElementById('task-list');
+  const ids = Object.keys(tasks).reverse();  // newest first
+
+  if (ids.length === 0) {
+    container.innerHTML = '<div class="no-tasks" id="no-tasks">暂无任务，上传文件开始</div>';
+    return;
+  }
+
+  let html = '';
+  for (const jobId of ids) {
+    const t = tasks[jobId];
+    const status = t.status;
+    let cssClass = 'task-status';
+    let statusIcon = '';
+    let statusText = '等待中...';
+    let actions = '';
+
+    if (status === 'created') {
+      cssClass = 'task-status'; statusIcon = '<span class="spinner"></span>'; statusText = '排队中...';
+    } else if (status === 'running') {
+      cssClass = 'task-running'; statusIcon = '<span class="spinner"></span>';
+      statusText = `生成中 ${t.progress}/${t.steps || '?'}`;
+    } else if (status === 'completed') {
+      cssClass = 'task-done'; statusIcon = '✅'; statusText = '完成';
+      actions = `<a class="btn-sm btn-dl" href="/api/jobs/${jobId}/download" download>📥 下载</a>`;
+    } else if (status === 'failed') {
+      cssClass = 'task-fail'; statusIcon = '❌'; statusText = '失败';
+      if (t.error) statusText += ' — ' + t.error.substring(0, 60);
+    }
+
+    html += `<div class="task-item ${cssClass}">
+      <span>${statusIcon}</span>
+      <div class="task-info">
+        <div class="task-text">${statusText}</div>
+        <div class="task-id">${jobId}</div>
+      </div>
+      <div class="task-actions">
+        ${actions}
+        ${status === 'completed' || status === 'failed' ? `<button class="btn-sm btn-del" onclick="removeTask('${jobId}')" title="移除">✕</button>` : ''}
+      </div>
+    </div>`;
+  }
+  container.innerHTML = html;
+}
+</script>
+</body>
+</html>
