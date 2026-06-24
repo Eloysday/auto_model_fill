@@ -37,6 +37,30 @@ def hex_to_rgb(hex_color):
     return None
 
 
+def add_field_to_run(run, field):
+    """向 run 中添加域代码元素"""
+    if not field:
+        return
+
+    field_type = field.get('type')
+    if field_type == 'begin':
+        fldChar = OxmlElement('w:fldChar')
+        fldChar.set(qn('w:fldCharType'), 'begin')
+        run._element.append(fldChar)
+    elif field_type == 'separate':
+        fldChar = OxmlElement('w:fldChar')
+        fldChar.set(qn('w:fldCharType'), 'separate')
+        run._element.append(fldChar)
+    elif field_type == 'end':
+        fldChar = OxmlElement('w:fldChar')
+        fldChar.set(qn('w:fldCharType'), 'end')
+        run._element.append(fldChar)
+    elif field_type == 'instruction':
+        instrText = OxmlElement('w:instrText')
+        instrText.text = field.get('value', '')
+        run._element.append(instrText)
+
+
 def set_run_font(run, fmt, defaults=None):
     """设置单个 <w:r> 的字体格式"""
     if not fmt:
@@ -93,13 +117,14 @@ def set_run_font(run, fmt, defaults=None):
     # ── 字体名称 ──
     font = fmt.get('font', {})
     if font:
+        rFonts = rPr.find(qn('w:rFonts'))
+        if rFonts is None:
+            rFonts = OxmlElement('w:rFonts')
+            rPr.insert(0, rFonts)
+        
         name = font.get('ascii') or font.get('hAnsi') or font.get('eastAsia')
         if name:
             run.font.name = name
-            rFonts = rPr.find(qn('w:rFonts'))
-            if rFonts is None:
-                rFonts = OxmlElement('w:rFonts')
-                rPr.insert(0, rFonts)
             # 先清除主题字体引用
             for theme_attr in ('w:asciiTheme', 'w:eastAsiaTheme', 'w:hAnsiTheme', 'w:cstheme'):
                 if rFonts.get(qn(theme_attr)):
@@ -111,6 +136,9 @@ def set_run_font(run, fmt, defaults=None):
                 rFonts.set(qn('w:hAnsi'), font['hAnsi'])
             if font.get('cs'):
                 rFonts.set(qn('w:cs'), font['cs'])
+        
+        if font.get('hint'):
+            rFonts.set(qn('w:hint'), font['hint'])
 
     # ── 上/下标 ──
     va = fmt.get('vertAlign')
@@ -423,8 +451,10 @@ def restore_docx(json_data, output_path):
             for run_data in runs:
                 text = run_data.get('text', '')
                 fmt  = run_data.get('fmt', {})
+                field = run_data.get('field')
                 run = paragraph.add_run(text)
                 set_run_font(run, fmt)
+                add_field_to_run(run, field)
 
             # ── 图片嵌入 ──
             image_data = block.get('image')
@@ -537,8 +567,10 @@ def restore_docx(json_data, output_path):
                         for run_data in p_data.get('runs', []):
                             text = run_data.get('text', '')
                             fmt  = run_data.get('fmt', {})
+                            field = run_data.get('field')
                             run = p.add_run(text)
                             set_run_font(run, fmt)
+                            add_field_to_run(run, field)
 
                     # ── 单元格格式 ──
                     cell_fmt = cell_data.get('cellFmt', {})
@@ -548,6 +580,78 @@ def restore_docx(json_data, output_path):
                         set_cell_borders(cell, cell_fmt['borders'])
                     if 'margins' in cell_fmt:
                         set_cell_margins(cell, cell_fmt['margins'])
+
+    # ═══ 还原页眉页脚 ═══
+    headers = data.get('headers', {})
+    footers = data.get('footers', {})
+
+    print(f"[restore_hf] 开始还原页眉页脚: 页眉={len(headers)}种, 页脚={len(footers)}种")
+
+    # 还原页眉
+    for htype, hblocks in headers.items():
+        if htype == 'default':
+            header = section.header
+        elif htype == 'first':
+            header = section.first_page_header
+        elif htype == 'even':
+            header = section.even_page_header
+        else:
+            continue
+
+        for para in header.paragraphs:
+            p_elem = para._element
+            p_elem.getparent().remove(p_elem)
+
+        print(f"[restore_hf] 还原页眉类型={htype}, 块数={len(hblocks)}")
+        for block in hblocks:
+            if block.get('type') == 'paragraph':
+                paragraph = header.add_paragraph()
+                para_fmt = block.get('paraFmt')
+                if para_fmt:
+                    set_paragraph_format(paragraph, para_fmt)
+
+                for run_data in block.get('runs', []):
+                    text = run_data.get('text', '')
+                    fmt = run_data.get('fmt', {})
+                    field = run_data.get('field')
+                    run = paragraph.add_run(text)
+                    set_run_font(run, fmt)
+                    add_field_to_run(run, field)
+                    if field or fmt:
+                        print(f"[restore_hf] 页眉 run: 文本='{text[:20]}', 样式={fmt}, 域代码={field}")
+
+    # 还原页脚
+    for ftype, fblocks in footers.items():
+        if ftype == 'default':
+            footer = section.footer
+        elif ftype == 'first':
+            footer = section.first_page_footer
+        elif ftype == 'even':
+            footer = section.even_page_footer
+        else:
+            continue
+
+        for para in footer.paragraphs:
+            p_elem = para._element
+            p_elem.getparent().remove(p_elem)
+
+        print(f"[restore_hf] 还原页脚类型={ftype}, 块数={len(fblocks)}")
+        for block in fblocks:
+            if block.get('type') == 'paragraph':
+                paragraph = footer.add_paragraph()
+                para_fmt = block.get('paraFmt')
+                if para_fmt:
+                    set_paragraph_format(paragraph, para_fmt)
+
+                for run_data in block.get('runs', []):
+                    text = run_data.get('text', '')
+                    fmt = run_data.get('fmt', {})
+                    field = run_data.get('field')
+                    run = paragraph.add_run(text)
+                    set_run_font(run, fmt)
+                    add_field_to_run(run, field)
+                    if field or fmt:
+                        print(f"[restore_hf] 页脚 run: 文本='{text[:20]}', 样式={fmt}, 域代码={field}")
 
     # ═══ 保存 ═══
     doc.save(output_path)

@@ -23,6 +23,7 @@ NS_DRAW = '{http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawi
 NS_A = '{http://schemas.openxmlformats.org/drawingml/2006/main}'
 NS_PIC = '{http://schemas.openxmlformats.org/drawingml/2006/picture}'
 NS_R = '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}'
+NS_RELS = '{http://schemas.openxmlformats.org/package/2006/relationships}'
 
 
 def _a(el, attr, ns=NS):
@@ -47,7 +48,7 @@ def extract_style_rpr(rpr_elem):
     if rpr_elem is None:
         return None
     props = {}
-    # Font — 只记录显式字体名，跳过主题引用（还原时无法解析主题）
+    # Font — 记录字体名和 hint 属性
     rf = rpr_elem.find(f'{NS}rFonts')
     if rf is not None:
         f = {}
@@ -55,6 +56,9 @@ def extract_style_rpr(rpr_elem):
             v = _a(rf, k)
             if v:
                 f[k] = v
+        hint = _a(rf, 'hint')
+        if hint:
+            f['hint'] = hint
         if f:
             props['font'] = f
     # Size
@@ -269,15 +273,63 @@ def extract_style_tcpr(tcpr_elem):
 
 # ─── Block extraction ─────────────────────────────────────
 
+def _extract_header_footer_content(docx_path, target):
+    """从 docx 文件中提取页眉或页脚的内容"""
+    try:
+        with zipfile.ZipFile(docx_path, 'r') as zf:
+            header_footer_path = f'word/{target}'
+            content_xml = zf.read(header_footer_path)
+            elem = etree.fromstring(content_xml)
+
+            blocks = []
+            for idx, child in enumerate(elem):
+                tag = child.tag.replace(NS, 'w:')
+                if tag == 'w:p':
+                    block = extract_paragraph(child)
+                    block['index'] = idx
+                    blocks.append(block)
+                    has_fields = any(r.get('field') for r in block.get('runs', []))
+                    has_styles = any(r.get('fmt') for r in block.get('runs', []))
+                    print(f"[extract_hf] 提取段落 #{idx}, 字段数={len(block.get('runs', []))}, 包含域代码={has_fields}, 包含样式={has_styles}")
+                elif tag == 'w:tbl':
+                    block = extract_table(child)
+                    block['index'] = idx
+                    blocks.append(block)
+
+            print(f"[extract_hf] {target} 共提取 {len(blocks)} 个块")
+            return blocks if blocks else None
+    except (KeyError, Exception) as e:
+        print(f"[extract_hf] 提取 {target} 失败: {e}")
+        return None
+
+
 def extract_run(r_elem):
-    """Extract a single <w:r> into {text, format}."""
+    """Extract a single <w:r> into {text, format, field}."""
     text = ''.join(r_elem.xpath('.//w:t/text()',
         namespaces={'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}))
     rPr = r_elem.find(f'{NS}rPr')
     fmt = extract_style_rpr(rPr)
+    
+    field = None
+    fldChar = r_elem.find(f'{NS}fldChar')
+    if fldChar is not None:
+        fldCharType = _a(fldChar, 'fldCharType')
+        if fldCharType:
+            field = {'type': fldCharType}
+    
+    instrText = r_elem.find(f'{NS}instrText')
+    if instrText is not None:
+        instr_val = instrText.text or ''
+        field = {'type': 'instruction', 'value': instr_val.strip()}
+    
+    if field or fmt:
+        print(f"[extract_run] 文本='{text[:20]}', 样式={fmt}, 域代码={field}")
+    
     result = {'text': text}
     if fmt:
         result['fmt'] = fmt
+    if field:
+        result['field'] = field
     return result
 
 
@@ -291,9 +343,14 @@ def extract_paragraph(p_elem):
         if ps is not None:
             style_id = _a(ps, 'val')
 
-    runs = [extract_run(r) for r in p_elem.findall(f'{NS}r') if ''.join(
-        r.xpath('.//w:t/text()',
-        namespaces={'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}))]
+    runs = []
+    for r in p_elem.findall(f'{NS}r'):
+        has_text = bool(''.join(r.xpath('.//w:t/text()',
+            namespaces={'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'})))
+        has_fldChar = r.find(f'{NS}fldChar') is not None
+        has_instrText = r.find(f'{NS}instrText') is not None
+        if has_text or has_fldChar or has_instrText:
+            runs.append(extract_run(r))
 
     # Check for image
     drawing = p_elem.find(f'{NS}r/{NS}drawing')
@@ -372,13 +429,32 @@ def docx_to_json(docx_path):
         doc_xml = zf.read('word/document.xml')
         styles_xml = zf.read('word/styles.xml')
 
+        # 读取关系文件，用于解析页眉页脚引用
+        try:
+            rels_xml = zf.read('word/_rels/document.xml.rels')
+        except KeyError:
+            rels_xml = None
+
     doc = etree.fromstring(doc_xml)
     styles_doc = etree.fromstring(styles_xml)
     body = doc.find(f'{NS}body')
 
+    # ── 解析关系映射 ──
+    rels_map = {}
+    if rels_xml:
+        rels_doc = etree.fromstring(rels_xml)
+        for rel in rels_doc.findall(f'{NS_RELS}Relationship'):
+            rid = rel.get('Id')
+            target = rel.get('Target')
+            if rid and target:
+                rels_map[rid] = target
+
     # ── Page setup ──
     sectPr = body.find(f'{NS}sectPr')
     page = {}
+    headers = {}
+    footers = {}
+
     if sectPr is not None:
         pgSz = sectPr.find(f'{NS}pgSz')
         if pgSz is not None:
@@ -394,6 +470,32 @@ def docx_to_json(docx_path):
                 'header': _int(pgMar.get(f'{NS}header')),
                 'footer': _int(pgMar.get(f'{NS}footer')),
             }
+
+        # ── 提取页眉页脚引用 ──
+        header_refs = sectPr.findall(f'{NS}headerReference')
+        footer_refs = sectPr.findall(f'{NS}footerReference')
+
+        # 解析页眉
+        for href in header_refs:
+            htype = _a(href, 'type')  # default/first/even
+            rid = _a(href, 'id', NS_R)
+            if htype and rid and rid in rels_map:
+                target = rels_map[rid]
+                # 提取页眉内容
+                header_content = _extract_header_footer_content(docx_path, target)
+                if header_content:
+                    headers[htype] = header_content
+
+        # 解析页脚
+        for fref in footer_refs:
+            ftype = _a(fref, 'type')  # default/first/even
+            rid = _a(fref, 'id', NS_R)
+            if ftype and rid and rid in rels_map:
+                target = rels_map[rid]
+                # 提取页脚内容
+                footer_content = _extract_header_footer_content(docx_path, target)
+                if footer_content:
+                    footers[ftype] = footer_content
 
     # ── Document defaults ──
     defaults = {}
@@ -471,6 +573,8 @@ def docx_to_json(docx_path):
         'defaults': defaults,
         'styles': styles,
         'blocks': blocks,
+        'headers': headers,
+        'footers': footers,
     }
 
 

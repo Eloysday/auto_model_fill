@@ -1,0 +1,14 @@
+{
+  "status": "failed",
+  "progress": 2,
+  "instructions": "",
+  "created_at": "2026-06-24T03:52:16Z",
+  "updated_at": "2026-06-24T03:52:20Z",
+  "input_files": [
+    "template.docx",
+    "data.csv"
+  ],
+  "output_file": null,
+  "error": "OpenAIError: The api_key client option must be set either by passing api_key to the client or by setting the OPENAI_API_KEY environment variable",
+  "steps": 7
+}
